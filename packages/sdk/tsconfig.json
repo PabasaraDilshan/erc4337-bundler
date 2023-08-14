@@ -15,7 +15,10 @@
     "experimentalDecorators": true,
     "emitDecoratorMetadata": true,
     "sourceMap": true,
-    "outDir": "dist"
+    "outDir": "dist",
+    "paths": {
+      "@account-abstraction/utils": ["../../node_modules/@account-abstraction/utils"]
+    }
   },
   "include": [
     "./**/*.ts"

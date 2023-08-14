@@ -65,7 +65,7 @@ export function calcPreVerificationGas (userOp: Partial<NotPromise<UserOperation
     preVerificationGas: 21000, // dummy value, just for calldata cost
     signature: hexlify(Buffer.alloc(ov.sigSize, 1)), // dummy signature
     ...userOp
-  } as any
+  }
 
   const packed = arrayify(packUserOp(p, false))
   const lengthInWord = (packed.length + 31) / 32
