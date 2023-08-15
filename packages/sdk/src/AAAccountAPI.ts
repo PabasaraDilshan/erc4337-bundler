@@ -21,7 +21,7 @@ import { AddressZero } from '@ethersproject/constants'
 import { resolveProperties } from '@ethersproject/properties'
 import { calcPreVerificationGas, HttpRpcClient } from './'
 import { JsonRpcProvider, Provider, TransactionReceipt } from '@ethersproject/providers'
-import AAPaymasterAPI from './AAPaymasterAPI'
+import { AAPaymasterAPI } from './AAPaymasterAPI'
 import { formatEther } from '@ethersproject/units'
 import { Contract } from '@ethersproject/contracts'
 import { erc20ABI } from './contracts'
@@ -34,7 +34,7 @@ import { UserOperationEventEvent } from '@account-abstraction/contracts/dist/typ
  * - nonce method is "nonce()"
  * - execute method is "execFromEntryPoint()"
  */
-class AAAccountAPI extends AccountApiType {
+export class AAAccountAPI extends AccountApiType {
   name: string
   factoryAddress?: string
   owner?: Wallet
@@ -250,22 +250,29 @@ class AAAccountAPI extends AccountApiType {
    * - if gas or nonce are missing, read them from the chain (note that we can't fill gaslimit before the account is created)
    * @param info
    */
-  async createUnsignedUserOp (info: TransactionDetailsForUserOp): Promise<UserOperationStruct> {
-    const { callData, callGasLimit } = await this.encodeUserOpCallDataAndGasLimit(info)
+  async createUnsignedUserOp (
+    info: TransactionDetailsForUserOp
+  ): Promise<UserOperationStruct> {
+    const { callData, callGasLimit } =
+      await this.encodeUserOpCallDataAndGasLimit(info)
     const initCode = await this.getInitCode()
 
     const initGas = await this.estimateCreationGas(initCode)
-    const verificationGasLimit = BigNumber.from(await this.getVerificationGasLimit()).add(initGas)
-
+    const verificationGasLimit = BigNumber.from(
+      info.verificationGasLimit !== undefined ? info.verificationGasLimit : (await this.getVerificationGasLimit())
+    ).add(initGas)
+    console.warn('Verification gas limit', verificationGasLimit)
     let { maxFeePerGas, maxPriorityFeePerGas } = info
     if (maxFeePerGas == null || maxPriorityFeePerGas == null) {
-      const feeData = await this.provider.getFeeData()
+      const feeData = await AAAccountAPI.getGasPrice(this.providerUrl)
       if (maxFeePerGas == null) {
         maxFeePerGas = feeData.maxFeePerGas ?? undefined
       }
       if (maxPriorityFeePerGas == null) {
         maxPriorityFeePerGas = feeData.maxPriorityFeePerGas ?? undefined
       }
+
+      console.warn('Fee data', feeData)
     }
 
     const partialUserOp: any = {
@@ -274,10 +281,7 @@ class AAAccountAPI extends AccountApiType {
       initCode,
       callData,
       callGasLimit,
-      verificationGasLimit:
-        this.maxVerificationGasLimit < verificationGasLimit
-          ? this.maxVerificationGasLimit
-          : verificationGasLimit,
+      verificationGasLimit,
       maxFeePerGas,
       maxPriorityFeePerGas,
       paymasterAndData: '0x'
@@ -298,23 +302,32 @@ class AAAccountAPI extends AccountApiType {
 
       if (pm_Response != null) {
         preVerificationGas = pm_Response.preVerificationGas
-        partialUserOp.verificationGasLimit = BigNumber.from(pm_Response.verificationGasLimit)
+        partialUserOp.verificationGasLimit = BigNumber.from(
+          pm_Response.verificationGasLimit
+        )
         partialUserOp.callGasLimit = BigNumber.from(pm_Response.callGasLimit)
 
         partialUserOp.maxFeePerGas = BigNumber.from(pm_Response.maxFeePerGas)
-        partialUserOp.maxPriorityFeePerGas = BigNumber.from(pm_Response.maxPriorityFeePerGas)
+        partialUserOp.maxPriorityFeePerGas = BigNumber.from(
+          pm_Response.maxPriorityFeePerGas
+        )
         partialUserOp.paymasterAndData = pm_Response.paymasterAndData
       }
     } else {
-      console.log('..........................Paymaster not defined...................')
+      console.error('Paymaster not defined')
     }
     if (preVerificationGas === undefined) {
-      console.log('For previrification Gas', partialUserOp)
-
       preVerificationGas = await this.getPreVerificationGas(partialUserOp)
       preVerificationGas += 1000
     }
 
+    console.warn(
+      'Max prefund1',
+      BigNumber.from(preVerificationGas)
+        .add(BigNumber.from(partialUserOp.verificationGasLimit).mul(3))
+        .add(partialUserOp.callGasLimit)
+        .mul(partialUserOp.maxFeePerGas)
+    )
     return {
       ...partialUserOp,
       preVerificationGas,
@@ -596,5 +609,3 @@ class AAAccountAPI extends AccountApiType {
     return formatEther(bal)
   }
 }
-
-export default AAAccountAPI

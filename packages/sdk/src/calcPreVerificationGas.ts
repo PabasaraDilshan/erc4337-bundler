@@ -1,5 +1,6 @@
 import { UserOperationStruct } from '@account-abstraction/contracts'
 import { NotPromise, packUserOp } from '@account-abstraction/utils'
+import { BigNumber } from 'ethers'
 import { arrayify, hexlify } from 'ethers/lib/utils'
 
 export interface GasOverheads {
@@ -39,12 +40,14 @@ export interface GasOverheads {
    * expected length of the userOp signature.
    */
   sigSize: number
+  batchFixed: number
 }
 
 export const DefaultGasOverheads: GasOverheads = {
   fixed: 21000,
-  perUserOp: 18300,
-  perUserOpWord: 4,
+  perUserOp: 22874,
+  perUserOpWord: 25,
+  batchFixed: 816,
   zeroByte: 4,
   nonZeroByte: 16,
   bundleSize: 1,
@@ -60,19 +63,23 @@ export const DefaultGasOverheads: GasOverheads = {
  */
 export function calcPreVerificationGas (userOp: Partial<NotPromise<UserOperationStruct>>, overheads?: Partial<GasOverheads>): number {
   const ov = { ...DefaultGasOverheads, ...(overheads ?? {}) }
+
   const p: NotPromise<UserOperationStruct> = {
     // dummy values, in case the UserOp is incomplete.
-    preVerificationGas: 21000, // dummy value, just for calldata cost
-    signature: hexlify(Buffer.alloc(ov.sigSize, 1)), // dummy signature
-    ...userOp
-  }
+  // dummy value, just for calldata cost
+    signature: hexlify(Buffer.alloc(ov.sigSize, 1)),
+    ...userOp,
 
+    preVerificationGas: BigNumber.from(100000),
+    verificationGasLimit: BigNumber.from(1000000),
+    callGasLimit: BigNumber.from(1000000)
+  } as any
   const packed = arrayify(packUserOp(p, false))
   const lengthInWord = (packed.length + 31) / 32
   const callDataCost = packed.map(x => x === 0 ? ov.zeroByte : ov.nonZeroByte).reduce((sum, x) => sum + x)
   const ret = Math.round(
     callDataCost +
-    ov.fixed / ov.bundleSize +
+    (ov.fixed + ov.batchFixed) / ov.bundleSize +
     ov.perUserOp +
     ov.perUserOpWord * lengthInWord
   )

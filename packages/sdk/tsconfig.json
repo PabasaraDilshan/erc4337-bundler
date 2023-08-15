@@ -21,7 +21,8 @@
     }
   },
   "include": [
-    "./**/*.ts"
+    "./**/*.ts",
+    "./src/contracts/erc20-abi.json" // Add the file
   ]
 }
 
