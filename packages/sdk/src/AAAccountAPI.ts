@@ -608,4 +608,20 @@ export class AAAccountAPI extends AccountApiType {
     const bal = await contract.balanceOf(address)
     return formatEther(bal)
   }
+
+  getBalance = async (assetAddress?: string): Promise<string> => {
+    const accAddress = await this.getAccountAddress()
+    if (assetAddress !== undefined) {
+      return await AAAccountAPI.getERC20TokenBalance(
+        accAddress,
+        this.providerUrl,
+        assetAddress
+      )
+    } else {
+      return await AAAccountAPI.getNativeBalance(
+        accAddress,
+        this.providerUrl
+      )
+    }
+  }
 }
