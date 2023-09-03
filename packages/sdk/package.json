@@ -1,6 +1,6 @@
 {
   "name": "aa-userop",
-  "version": "0.6.4",
+  "version": "0.6.5",
   "main": "./dist/src/index.js",
   "license": "MIT",
   "files": [
