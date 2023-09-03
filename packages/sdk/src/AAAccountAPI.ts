@@ -22,7 +22,6 @@ import { resolveProperties } from '@ethersproject/properties'
 import { calcPreVerificationGas, HttpRpcClient } from './'
 import { JsonRpcProvider, Provider, TransactionReceipt } from '@ethersproject/providers'
 import { AAPaymasterAPI } from './AAPaymasterAPI'
-import { formatEther } from '@ethersproject/units'
 import { Contract } from '@ethersproject/contracts'
 import { erc20ABI } from './contracts'
 import { UserOperationEventEvent } from '@account-abstraction/contracts/dist/types/EntryPoint'
@@ -591,25 +590,25 @@ export class AAAccountAPI extends AccountApiType {
     return await this.provider.getTransactionReceipt(txnHash)
   }
 
-  static getNativeBalance = async (address: string, rpcUrl: string): Promise<string> => {
+  static getNativeBalance = async (address: string, rpcUrl: string): Promise<BigNumber> => {
     const provider = new JsonRpcProvider(rpcUrl)
     await provider.ready
     const bal = await provider.getBalance(address)
-    return formatEther(bal)
+    return bal
   }
 
   static getERC20TokenBalance = async (
     address: string,
     rpcUrl: string,
     contractAddress: string
-  ): Promise<string> => {
+  ): Promise<BigNumber> => {
     const provider = new JsonRpcProvider(rpcUrl)
     const contract = new Contract(contractAddress, erc20ABI, provider)
     const bal = await contract.balanceOf(address)
-    return formatEther(bal)
+    return bal
   }
 
-  getBalance = async (assetAddress?: string): Promise<string> => {
+  getBalance = async (assetAddress?: string): Promise<BigNumber> => {
     const accAddress = await this.getAccountAddress()
     if (assetAddress !== undefined) {
       return await AAAccountAPI.getERC20TokenBalance(
