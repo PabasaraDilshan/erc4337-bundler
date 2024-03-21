@@ -2,17 +2,19 @@ import { DebugMethodHandler } from '../src/DebugMethodHandler'
 import { ExecutionManager } from '../src/modules/ExecutionManager'
 import { BundlerReputationParams, ReputationManager } from '../src/modules/ReputationManager'
 import { BundlerConfig } from '../src/BundlerConfig'
-import { supportsDebugTraceCall } from '../src/utils'
 import { parseEther } from 'ethers/lib/utils'
 import { MempoolManager } from '../src/modules/MempoolManager'
-import { ValidationManager } from '../src/modules/ValidationManager'
+import { ValidationManager, supportsDebugTraceCall } from '@account-abstraction/validation-manager'
 import { BundleManager, SendBundleReturn } from '../src/modules/BundleManager'
 import { UserOpMethodHandler } from '../src/UserOpMethodHandler'
 import { ethers } from 'hardhat'
-import { EntryPoint, EntryPoint__factory, SimpleAccountFactory__factory } from '@account-abstraction/contracts'
-import { DeterministicDeployer, SimpleAccountAPI } from '@account-abstraction/sdk'
+import { SimpleAccountAPI } from '@account-abstraction/sdk'
 import { Signer, Wallet } from 'ethers'
-import { resolveHexlify } from '@account-abstraction/utils'
+import {
+  IEntryPoint,
+  resolveHexlify,
+  SimpleAccountFactory__factory, deployEntryPoint, DeterministicDeployer
+} from '@account-abstraction/utils'
 import { expect } from 'chai'
 import { createSigner } from './testUtils'
 import { EventsManager } from '../src/modules/EventsManager'
@@ -21,7 +23,7 @@ const provider = ethers.provider
 
 describe('#DebugMethodHandler', () => {
   let debugMethodHandler: DebugMethodHandler
-  let entryPoint: EntryPoint
+  let entryPoint: IEntryPoint
   let methodHandler: UserOpMethodHandler
   let smartAccountAPI: SimpleAccountAPI
   let signer: Signer
@@ -30,7 +32,7 @@ describe('#DebugMethodHandler', () => {
   before(async () => {
     signer = await createSigner()
 
-    entryPoint = await new EntryPoint__factory(signer).deploy()
+    entryPoint = await deployEntryPoint(provider)
     DeterministicDeployer.init(provider)
 
     const config: BundlerConfig = {
@@ -51,9 +53,9 @@ describe('#DebugMethodHandler', () => {
       minUnstakeDelay: 0
     }
 
-    const repMgr = new ReputationManager(BundlerReputationParams, parseEther(config.minStake), config.minUnstakeDelay)
+    const repMgr = new ReputationManager(provider, BundlerReputationParams, parseEther(config.minStake), config.minUnstakeDelay)
     const mempoolMgr = new MempoolManager(repMgr)
-    const validMgr = new ValidationManager(entryPoint, repMgr, config.unsafe)
+    const validMgr = new ValidationManager(entryPoint, config.unsafe)
     const eventsManager = new EventsManager(entryPoint, mempoolMgr, repMgr)
     const bundleMgr = new BundleManager(entryPoint, eventsManager, mempoolMgr, validMgr, repMgr,
       config.beneficiary, parseEther(config.minBalance), config.maxBundleGas, false)

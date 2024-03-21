@@ -1,17 +1,21 @@
 import fs from 'fs'
 
 import { Command } from 'commander'
-import { erc4337RuntimeVersion } from '@account-abstraction/utils'
+import {
+  deployEntryPoint,
+  erc4337RuntimeVersion,
+  IEntryPoint,
+  RpcError,
+  supportsRpcMethod
+} from '@account-abstraction/utils'
 import { ethers, Wallet, Signer } from 'ethers'
 
 import { BundlerServer } from './BundlerServer'
 import { UserOpMethodHandler } from './UserOpMethodHandler'
-import { EntryPoint, EntryPoint__factory } from '@account-abstraction/contracts'
 
 import { initServer } from './modules/initServer'
 import { DebugMethodHandler } from './DebugMethodHandler'
-import { DeterministicDeployer } from '@account-abstraction/sdk'
-import { supportsDebugTraceCall, supportsRpcMethod } from './utils'
+import { supportsDebugTraceCall } from '@account-abstraction/validation-manager'
 import { resolveConfiguration } from './Config'
 import { bundlerConfigDefault } from './BundlerConfig'
 import { JsonRpcProvider } from '@ethersproject/providers'
@@ -30,8 +34,8 @@ export let showStackTraces = false
 
 export async function connectContracts (
   wallet: Signer,
-  entryPointAddress: string): Promise<{ entryPoint: EntryPoint }> {
-  const entryPoint = EntryPoint__factory.connect(entryPointAddress, wallet)
+  entryPointAddress: string): Promise<{ entryPoint: IEntryPoint }> {
+  const entryPoint = await deployEntryPoint(wallet.provider as any, wallet as any)
   return {
     entryPoint
   }
@@ -70,6 +74,7 @@ export async function runBundler (argv: string[], overrideExit = true): Promise<
     .option('--config <string>', 'path to config file', CONFIG_FILE_NAME)
     .option('--auto', 'automatic bundling (bypass config.autoBundleMempoolSize)', false)
     .option('--unsafe', 'UNSAFE mode: no storage or opcode checks (safe mode requires geth)')
+    .option('--debugRpc', 'enable debug rpc methods (auto-enabled for test node')
     .option('--conditionalRpc', 'Use eth_sendRawTransactionConditional RPC)')
     .option('--show-stack-traces', 'Show stack traces.')
     .option('--createMnemonic <file>', 'create the mnemonic file')
@@ -98,7 +103,15 @@ export async function runBundler (argv: string[], overrideExit = true): Promise<
   } = await provider.getNetwork()
 
   if (chainId === 31337 || chainId === 1337) {
-    await new DeterministicDeployer(provider as any).deterministicDeploy(EntryPoint__factory.bytecode)
+    if (config.debugRpc == null) {
+      console.log('== debugrpc was', config.debugRpc)
+      config.debugRpc = true
+    } else {
+      console.log('== debugrpc already st', config.debugRpc)
+    }
+    const ep = await deployEntryPoint(provider as any)
+    const addr = ep.address
+    console.log('deployed EntryPoint at', addr)
     if ((await wallet.getBalance()).eq(0)) {
       console.log('=== testnet: fund signer')
       const signer = (provider as JsonRpcProvider).getSigner()
@@ -138,7 +151,13 @@ export async function runBundler (argv: string[], overrideExit = true): Promise<
     entryPoint
   )
   eventsManager.initEventListener()
-  const debugHandler = new DebugMethodHandler(execManager, eventsManager, reputationManager, mempoolManager)
+  const debugHandler = config.debugRpc ?? false
+    ? new DebugMethodHandler(execManager, eventsManager, reputationManager, mempoolManager)
+    : new Proxy({}, {
+      get (target: {}, method: string, receiver: any): any {
+        throw new RpcError(`method debug_bundler_${method} is not supported`, -32601)
+      }
+    }) as DebugMethodHandler
 
   const bundlerServer = new BundlerServer(
     methodHandler,

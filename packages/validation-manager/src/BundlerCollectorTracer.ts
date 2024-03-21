@@ -1,7 +1,11 @@
 // javascript code of tracer function
 // NOTE: we process this locally for hardhat, but send to geth for remote tracing.
 // should NOT "require" anything, or use logs.
-// see LogTrace for valid types (but alas, this one must be javascript, not typescript..
+// see LogTrace for valid types (but alas, this one must be javascript, not typescript).
+
+// This file contains references to validation rules, in the format [xxx-###]
+// where xxx is OP/STO/COD/EP/SREP/EREP/UREP/ALT, and ### is a number
+// the validation rules are defined in erc-aa-validation.md
 
 import { LogCallFrame, LogContext, LogDb, LogFrameResult, LogStep, LogTracer } from './GethTracer'
 
@@ -12,14 +16,12 @@ declare function toWord (a: any): string
 
 declare function toAddress (a: any): string
 
-declare function isPrecompiled (addr: any): boolean
-
 /**
  * return type of our BundlerCollectorTracer.
  * collect access and opcodes, split into "levels" based on NUMBER opcode
  * keccak, calls and logs are collected globally, since the levels are unimportant for them.
  */
-export interface BundlerCollectorReturn {
+export interface BundlerTracerResult {
   /**
    * storage and opcode info, collected on top-level calls from EntryPoint
    */
@@ -54,8 +56,18 @@ export interface TopLevelCallInfo {
   topLevelTargetAddress: string
   opcodes: { [opcode: string]: number }
   access: { [address: string]: AccessInfo }
-  contractSize: { [addr: string]: number }
+  contractSize: { [addr: string]: ContractSizeInfo }
+  extCodeAccessInfo: { [addr: string]: string }
   oog?: boolean
+}
+
+/**
+ * It is illegal to access contracts with no code in validation even if it gets deployed later.
+ * This means we need to store the {@link contractSize} of accessed addresses at the time of access.
+ */
+export interface ContractSizeInfo {
+  opcode: string
+  contractSize: number
 }
 
 export interface AccessInfo {
@@ -70,12 +82,18 @@ export interface LogInfo {
   data: string
 }
 
+interface RelevantStepData {
+  opcode: string
+  stackTop3: any[]
+}
+
 /**
  * type-safe local storage of our collector. contains all return-value properties.
  * (also defines all "trace-local" variables and functions)
  */
-interface BundlerCollectorTracer extends LogTracer, BundlerCollectorReturn {
+interface BundlerCollectorTracer extends LogTracer, BundlerTracerResult {
   lastOp: string
+  lastThreeOpcodes: RelevantStepData[]
   stopCollectingTopic: string
   stopCollecting: boolean
   currentLevel: TopLevelCallInfo
@@ -102,16 +120,17 @@ export function bundlerCollectorTracer (): BundlerCollectorTracer {
     logs: [],
     debug: [],
     lastOp: '',
+    lastThreeOpcodes: [],
     // event sent after all validations are done: keccak("BeforeExecution()")
     stopCollectingTopic: 'bb47ee3e183a558b1a2ff0874b079f3fc5478b7454eacf2bfc5af2ff5878f972',
     stopCollecting: false,
     topLevelCallCounter: 0,
 
-    fault (log: LogStep, db: LogDb): void {
+    fault (log: LogStep, _db: LogDb): void {
       this.debug.push('fault depth=', log.getDepth(), ' gas=', log.getGas(), ' cost=', log.getCost(), ' err=', log.getError())
     },
 
-    result (ctx: LogContext, db: LogDb): BundlerCollectorReturn {
+    result (_ctx: LogContext, _db: LogDb): BundlerTracerResult {
       return {
         callsFromEntryPoint: this.callsFromEntryPoint,
         keccak: this.keccak,
@@ -155,8 +174,21 @@ export function bundlerCollectorTracer (): BundlerCollectorTracer {
         return
       }
       const opcode = log.op.toString()
+
+      const stackSize = log.stack.length()
+      const stackTop3 = []
+      for (let i = 0; i < 3 && i < stackSize; i++) {
+        stackTop3.push(log.stack.peek(i))
+      }
+      this.lastThreeOpcodes.push({ opcode, stackTop3 })
+      if (this.lastThreeOpcodes.length > 3) {
+        this.lastThreeOpcodes.shift()
+      }
       // this.debug.push(this.lastOp + '-' + opcode + '-' + log.getDepth() + '-' + log.getGas() + '-' + log.getCost())
-      if (log.getGas() < log.getCost()) {
+      if (log.getGas() < log.getCost() || (
+        // special rule for SSTORE with gas metering
+        opcode === 'SSTORE' && log.getGas() < 2300)
+      ) {
         this.currentLevel.oog = true
       }
 
@@ -174,6 +206,8 @@ export function bundlerCollectorTracer (): BundlerCollectorTracer {
             data
           })
         }
+        // NOTE: flushing all history after RETURN
+        this.lastThreeOpcodes = []
       }
 
       if (log.getDepth() === 1) {
@@ -191,6 +225,7 @@ export function bundlerCollectorTracer (): BundlerCollectorTracer {
             topLevelTargetAddress,
             access: {},
             opcodes: {},
+            extCodeAccessInfo: {},
             contractSize: {}
           }
           this.topLevelCallCounter++
@@ -205,16 +240,45 @@ export function bundlerCollectorTracer (): BundlerCollectorTracer {
         return
       }
 
-      if (opcode.match(/^(EXT.*|CALL|CALLCODE|DELEGATECALL|STATICCALL)$/) != null) {
-        // this.debug.push('op=' + opcode + ' last=' + this.lastOp + ' stacksize=' + log.stack.length())
-        const idx = opcode.startsWith('EXT') ? 0 : 1
-        const addr = toAddress(log.stack.peek(idx).toString(16))
+      const lastOpInfo = this.lastThreeOpcodes[this.lastThreeOpcodes.length - 2]
+      // store all addresses touched by EXTCODE* opcodes
+      if (lastOpInfo?.opcode?.match(/^(EXT.*)$/) != null) {
+        const addr = toAddress(lastOpInfo.stackTop3[0].toString(16))
         const addrHex = toHex(addr)
-        if ((this.currentLevel.contractSize[addrHex] ?? 0) === 0 && !isPrecompiled(addr)) {
-          this.currentLevel.contractSize[addrHex] = db.getCode(addr).length
+        const last3opcodesString = this.lastThreeOpcodes.map(x => x.opcode).join(' ')
+        // only store the last EXTCODE* opcode per address - could even be a boolean for our current use-case
+        // [OP-051]
+        if (last3opcodesString.match(/^(\w+) EXTCODESIZE ISZERO$/) == null) {
+          this.currentLevel.extCodeAccessInfo[addrHex] = opcode
+          // this.debug.push(`potentially illegal EXTCODESIZE without ISZERO for ${addrHex}`)
+        } else {
+          // this.debug.push(`safe EXTCODESIZE with ISZERO for ${addrHex}`)
         }
       }
 
+      // not using 'isPrecompiled' to only allow the ones defined by the ERC-4337 as stateless precompiles
+      // [OP-062]
+      const isAllowedPrecompiled: (address: any) => boolean = (address) => {
+        const addrHex = toHex(address)
+        const addressInt = parseInt(addrHex)
+        // this.debug.push(`isPrecompiled address=${addrHex} addressInt=${addressInt}`)
+        return addressInt > 0 && addressInt < 10
+      }
+      // [OP-041]
+      if (opcode.match(/^(EXT.*|CALL|CALLCODE|DELEGATECALL|STATICCALL)$/) != null) {
+        const idx = opcode.startsWith('EXT') ? 0 : 1
+        const addr = toAddress(log.stack.peek(idx).toString(16))
+        const addrHex = toHex(addr)
+        // this.debug.push('op=' + opcode + ' last=' + this.lastOp + ' stacksize=' + log.stack.length() + ' addr=' + addrHex)
+        if (this.currentLevel.contractSize[addrHex] == null && !isAllowedPrecompiled(addr)) {
+          this.currentLevel.contractSize[addrHex] = {
+            contractSize: db.getCode(addr).length,
+            opcode
+          }
+        }
+      }
+
+      // [OP-012]
       if (this.lastOp === 'GAS' && !opcode.includes('CALL')) {
         // count "GAS" opcode only if not followed by "CALL"
         this.countSlot(this.currentLevel.opcodes, 'GAS')

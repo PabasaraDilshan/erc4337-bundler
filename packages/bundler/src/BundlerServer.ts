@@ -5,13 +5,18 @@ import { Provider } from '@ethersproject/providers'
 import { Signer, utils } from 'ethers'
 import { parseEther } from 'ethers/lib/utils'
 
-import { AddressZero, deepHexlify, erc4337RuntimeVersion } from '@account-abstraction/utils'
+import {
+  AddressZero, decodeRevertReason,
+  deepHexlify, IEntryPoint__factory,
+  erc4337RuntimeVersion,
+  packUserOp,
+  RpcError,
+  UserOperation
+} from '@account-abstraction/utils'
 
 import { BundlerConfig } from './BundlerConfig'
 import { UserOpMethodHandler } from './UserOpMethodHandler'
 import { Server } from 'http'
-import { RpcError } from './utils'
-import { EntryPoint__factory, UserOperationStruct } from '@account-abstraction/contracts'
 import { DebugMethodHandler } from './DebugMethodHandler'
 
 import Debug from 'debug'
@@ -20,6 +25,7 @@ const debug = Debug('aa.rpc')
 export class BundlerServer {
   app: Express
   private readonly httpServer: Server
+  public silent = false
 
   constructor (
     readonly methodHandler: UserOpMethodHandler,
@@ -58,11 +64,9 @@ export class BundlerServer {
     }
 
     // minimal UserOp to revert with "FailedOp"
-    const emptyUserOp: UserOperationStruct = {
+    const emptyUserOp: UserOperation = {
       sender: AddressZero,
       callData: '0x',
-      initCode: AddressZero,
-      paymasterAndData: '0x',
       nonce: 0,
       preVerificationGas: 0,
       verificationGasLimit: 100000,
@@ -72,18 +76,19 @@ export class BundlerServer {
       signature: '0x'
     }
     // await EntryPoint__factory.connect(this.config.entryPoint,this.provider).callStatic.addStake(0)
-    const err = await EntryPoint__factory.connect(this.config.entryPoint, this.provider).callStatic.simulateValidation(emptyUserOp)
-      .catch(e => e)
-    if (err?.errorName !== 'FailedOp') {
-      this.fatal(`Invalid entryPoint contract at ${this.config.entryPoint}. wrong version?`)
+    try {
+      await IEntryPoint__factory.connect(this.config.entryPoint, this.provider).callStatic.getUserOpHash(packUserOp(emptyUserOp))
+    } catch (e: any) {
+      this.fatal(`Invalid entryPoint contract at ${this.config.entryPoint}. wrong version? ${decodeRevertReason(e, false) as string}`)
     }
+
     const signerAddress = await this.wallet.getAddress()
     const bal = await this.provider.getBalance(signerAddress)
-    console.log('signer', signerAddress, 'balance', utils.formatEther(bal))
+    this.log('signer', signerAddress, 'balance', utils.formatEther(bal))
     if (bal.eq(0)) {
       this.fatal('cannot run with zero balance')
     } else if (bal.lt(parseEther(this.config.minBalance))) {
-      console.log('WARNING: initial balance below --minBalance ', this.config.minBalance)
+      this.log('WARNING: initial balance below --minBalance ', this.config.minBalance)
     }
   }
 
@@ -115,7 +120,7 @@ export class BundlerServer {
         data: err.data,
         code: err.code
       }
-      console.log('failed: ', 'rpc::res.send()', 'error:', JSON.stringify(error))
+      this.log('failed: ', 'rpc::res.send()', 'error:', JSON.stringify(error))
     }
   }
 
@@ -129,7 +134,7 @@ export class BundlerServer {
     debug('>>', { jsonrpc, id, method, params })
     try {
       const result = deepHexlify(await this.handleMethod(method, params))
-      console.log('sent', method, '-', result)
+      debug('sent', method, '-', result)
       debug('<<', { jsonrpc, id, result })
       return {
         jsonrpc,
@@ -142,7 +147,7 @@ export class BundlerServer {
         data: err.data,
         code: err.code
       }
-      console.log('failed: ', method, 'error:', JSON.stringify(error))
+      this.log('failed: ', method, 'error:', JSON.stringify(error), err)
       debug('<<', { jsonrpc, id, error })
       return {
         jsonrpc,
@@ -185,12 +190,20 @@ export class BundlerServer {
       case 'debug_bundler_dumpMempool':
         result = await this.debugHandler.dumpMempool()
         break
+      case 'debug_bundler_clearMempool':
+        this.debugHandler.clearMempool()
+        result = 'ok'
+        break
       case 'debug_bundler_setReputation':
         await this.debugHandler.setReputation(params[0])
         result = 'ok'
         break
       case 'debug_bundler_dumpReputation':
         result = await this.debugHandler.dumpReputation()
+        break
+      case 'debug_bundler_clearReputation':
+        this.debugHandler.clearReputation()
+        result = 'ok'
         break
       case 'debug_bundler_setBundlingMode':
         await this.debugHandler.setBundlingMode(params[0])
@@ -206,9 +219,18 @@ export class BundlerServer {
           result = 'ok'
         }
         break
+      case 'debug_bundler_getStakeStatus':
+        result = await this.debugHandler.getStakeStatus(params[0], params[1])
+        break
       default:
         throw new RpcError(`Method ${method} is not supported`, -32601)
     }
     return result
+  }
+
+  log (...params: any[]): void {
+    if (!this.silent) {
+      console.log(...arguments)
+    }
   }
 }

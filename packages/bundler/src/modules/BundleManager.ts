@@ -1,18 +1,24 @@
-import { EntryPoint } from '@account-abstraction/contracts'
 import { MempoolManager } from './MempoolManager'
-import { ValidateUserOpResult, ValidationManager } from './ValidationManager'
+import { ValidateUserOpResult, ValidationManager } from '@account-abstraction/validation-manager'
 import { BigNumber, BigNumberish } from 'ethers'
 import { JsonRpcProvider, JsonRpcSigner } from '@ethersproject/providers'
 import Debug from 'debug'
 import { ReputationManager, ReputationStatus } from './ReputationManager'
 import { Mutex } from 'async-mutex'
 import { GetUserOpHashes__factory } from '../types'
-import { StorageMap, UserOperation } from './Types'
-import { getAddr, mergeStorageMap, runContractScript } from './moduleUtils'
+import {
+  UserOperation,
+  StorageMap,
+  mergeStorageMap,
+  runContractScript,
+  packUserOp, IEntryPoint
+} from '@account-abstraction/utils'
 import { EventsManager } from './EventsManager'
 import { ErrorDescription } from '@ethersproject/abi/lib/interface'
 
 const debug = Debug('aa.exec.cron')
+
+const THROTTLED_ENTITY_BUNDLE_COUNT = 4
 
 export interface SendBundleReturn {
   transactionHash: string
@@ -25,7 +31,7 @@ export class BundleManager {
   mutex = new Mutex()
 
   constructor (
-    readonly entryPoint: EntryPoint,
+    readonly entryPoint: IEntryPoint,
     readonly eventsManager: EventsManager,
     readonly mempoolManager: MempoolManager,
     readonly validationManager: ValidationManager,
@@ -78,7 +84,7 @@ export class BundleManager {
   async sendBundle (userOps: UserOperation[], beneficiary: string, storageMap: StorageMap): Promise<SendBundleReturn | undefined> {
     try {
       const feeData = await this.provider.getFeeData()
-      const tx = await this.entryPoint.populateTransaction.handleOps(userOps, beneficiary, {
+      const tx = await this.entryPoint.populateTransaction.handleOps(userOps.map(packUserOp), beneficiary, {
         type: 2,
         nonce: await this.signer.getTransactionCount(),
         gasLimit: 10e6,
@@ -86,18 +92,20 @@ export class BundleManager {
         maxFeePerGas: feeData.maxFeePerGas ?? 0
       })
       tx.chainId = this.provider._network.chainId
-      const signedTx = await this.signer.signTransaction(tx)
       let ret: string
       if (this.conditionalRpc) {
+        const signedTx = await this.signer.signTransaction(tx)
         debug('eth_sendRawTransactionConditional', storageMap)
         ret = await this.provider.send('eth_sendRawTransactionConditional', [
           signedTx, { knownAccounts: storageMap }
         ])
         debug('eth_sendRawTransactionConditional ret=', ret)
       } else {
-        // ret = await this.signer.sendTransaction(tx)
-        ret = await this.provider.send('eth_sendRawTransaction', [signedTx])
-        debug('eth_sendRawTransaction ret=', ret)
+        const resp = await this.signer.sendTransaction(tx)
+        const rcpt = await resp.wait()
+        ret = rcpt.transactionHash
+        // ret = await this.provider.send('eth_sendRawTransaction', [signedTx])
+        debug('eth_sendTransaction ret=', ret)
       }
       // TODO: parse ret, and revert if needed.
       debug('ret=', ret)
@@ -124,11 +132,11 @@ export class BundleManager {
       const userOp = userOps[opIndex]
       const reasonStr: string = reason.toString()
       if (reasonStr.startsWith('AA3')) {
-        this.reputationManager.crashedHandleOps(getAddr(userOp.paymasterAndData))
+        this.reputationManager.crashedHandleOps(userOp.paymaster)
       } else if (reasonStr.startsWith('AA2')) {
         this.reputationManager.crashedHandleOps(userOp.sender)
       } else if (reasonStr.startsWith('AA1')) {
-        this.reputationManager.crashedHandleOps(getAddr(userOp.initCode))
+        this.reputationManager.crashedHandleOps(userOp.factory)
       } else {
         this.mempoolManager.removeUserOp(userOp)
         console.warn(`Failed handleOps sender=${userOp.sender} reason=${reasonStr}`)
@@ -156,9 +164,7 @@ export class BundleManager {
     const senders = new Set<string>()
 
     // all entities that are known to be valid senders in the mempool
-    const knownSenders = entries.map(it => {
-      return it.userOp.sender.toLowerCase()
-    })
+    const knownSenders = this.mempoolManager.getKnownSenders()
 
     const storageMap: StorageMap = {}
     let totalGas = BigNumber.from(0)
@@ -166,19 +172,21 @@ export class BundleManager {
     // eslint-disable-next-line no-labels
     mainLoop:
     for (const entry of entries) {
-      const paymaster = getAddr(entry.userOp.paymasterAndData)
-      const factory = getAddr(entry.userOp.initCode)
+      const paymaster = entry.userOp.paymaster
+      const factory = entry.userOp.factory
       const paymasterStatus = this.reputationManager.getStatus(paymaster)
       const deployerStatus = this.reputationManager.getStatus(factory)
       if (paymasterStatus === ReputationStatus.BANNED || deployerStatus === ReputationStatus.BANNED) {
         this.mempoolManager.removeUserOp(entry.userOp)
         continue
       }
-      if (paymaster != null && (paymasterStatus === ReputationStatus.THROTTLED ?? (stakedEntityCount[paymaster] ?? 0) > 1)) {
+      // [SREP-030]
+      if (paymaster != null && (paymasterStatus === ReputationStatus.THROTTLED ?? (stakedEntityCount[paymaster] ?? 0) > THROTTLED_ENTITY_BUNDLE_COUNT)) {
         debug('skipping throttled paymaster', entry.userOp.sender, entry.userOp.nonce)
         continue
       }
-      if (factory != null && (deployerStatus === ReputationStatus.THROTTLED ?? (stakedEntityCount[factory] ?? 0) > 1)) {
+      // [SREP-030]
+      if (factory != null && (deployerStatus === ReputationStatus.THROTTLED ?? (stakedEntityCount[factory] ?? 0) > THROTTLED_ENTITY_BUNDLE_COUNT)) {
         debug('skipping throttled factory', entry.userOp.sender, entry.userOp.nonce)
         continue
       }
@@ -201,7 +209,7 @@ export class BundleManager {
       for (const storageAddress of Object.keys(validationResult.storageMap)) {
         if (
           storageAddress.toLowerCase() !== entry.userOp.sender.toLowerCase() &&
-          knownSenders.includes(storageAddress.toLowerCase())
+            knownSenders.includes(storageAddress.toLowerCase())
         ) {
           console.debug(`UserOperation from ${entry.userOp.sender} sender accessed a storage of another known sender ${storageAddress}`)
           // eslint-disable-next-line no-labels
@@ -235,7 +243,7 @@ export class BundleManager {
       }
 
       // If sender's account already exist: replace with its storage root hash
-      if (this.mergeToAccountRootHash && this.conditionalRpc && entry.userOp.initCode.length <= 2) {
+      if (this.mergeToAccountRootHash && this.conditionalRpc && entry.userOp.factory == null) {
         const { storageHash } = await this.provider.send('eth_getProof', [entry.userOp.sender, [], 'latest'])
         storageMap[entry.userOp.sender.toLowerCase()] = storageHash
       }
@@ -267,7 +275,7 @@ export class BundleManager {
   async getUserOpHashes (userOps: UserOperation[]): Promise<string[]> {
     const { userOpHashes } = await runContractScript(this.entryPoint.provider,
       new GetUserOpHashes__factory(),
-      [this.entryPoint.address, userOps])
+      [this.entryPoint.address, userOps.map(packUserOp)])
 
     return userOpHashes
   }
